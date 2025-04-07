@@ -2,93 +2,124 @@ import socket
 import threading
 import time
 import struct
+from typing import Optional, Callable, Dict, Any
 
-def hello(socket=None, address=None):
-    print("Hello!")
 
-def handshake(socket=None, address=None):
-    print("Handshake!")
+class FrameProtocol:
+    HEADER_SIZE = 4  # 4-byte length prefix
+    ENCODING = "utf-8"
+
+    @staticmethod
+    def encode_message(data: bytes) -> bytes:
+        return struct.pack(">I", len(data)) + data
+
+    @staticmethod
+    def decode_header(header: bytes) -> int:
+        return struct.unpack(">I", header)[0]
+
+    @classmethod
+    def receive_message(cls, sock: socket.socket) -> Optional[bytes]:
+        header = cls._recv_exact(sock, cls.HEADER_SIZE)
+        if not header:
+            return None
+        msg_len = cls.decode_header(header)
+        return cls._recv_exact(sock, msg_len)
+
+    @staticmethod
+    def _recv_exact(sock: socket.socket, n: int) -> Optional[bytes]:
+        data = bytearray()
+        while len(data) < n:
+            chunk = sock.recv(n - len(data))
+            if not chunk:
+                return None
+            data.extend(chunk)
+        return bytes(data)
+
 
 class Router:
     def __init__(self):
-        self.routes = {}
+        self.routes: Dict[str, Callable[..., Any]] = {}
+        self.default_handler = self._default_handler
 
-    def register_handler(self, route, handler):
+    def register(self, route: str, handler: Callable[..., Any]):
         self.routes[route] = handler
+        return self  # Enable method chaining
 
-    def handle_request(self, route, *args, **kwargs):
-        if route in self.routes.keys():
-            self.routes[route](*args, **kwargs)
-        else:
-            print("Unknown route")
+    def set_default(self, handler: Callable[..., Any]):
+        self.default_handler = handler
+        return self
+
+    def handle(self, route: str, *args, **kwargs) -> Any:
+        handler = self.routes.get(route, self.default_handler)
+        return handler(*args, **kwargs)
+
+    @staticmethod
+    def _default_handler(route: str, *args, **kwargs):
+        print(f"No handler for route: {route}")
+        return f"No handler for {route}"
+
 
 class Server:
-    def __init__(self, host, port):
+    def __init__(self, host: str, port: int):
         self.host = host
         self.port = port
         self.server_socket = None
-        self.router = None
-        self.running = False
-        self._create_socket()
-        self._init_router()
-
-    def _init_router(self):
         self.router = Router()
-        self.router.register_handler("hello", hello)
-        self.router.register_handler("handshake", handshake)
+        self.running = False
+        self._setup()
+
+    def _setup(self):
+        self._create_socket()
+        self._init_routes()
 
     def _create_socket(self):
         self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 
-    def _recv_all(self, sock, n):
-        data = bytearray()
-        while len(data) < n:
-            packet = sock.recv(n - len(data))
-            if not packet:
-                return None
-            data.extend(packet)
-        return data
+    def _init_routes(self):
+        self.router.register("hello", self._handle_hello)
+        self.router.register("handshake", self._handle_handshake)
 
-    def handle_client(self, socket, address):
-        print(f"[+] Connected to {address}")
+    def _handle_hello(self, conn: socket.socket, address: tuple):
+        print("Hello handler executed")
+        conn.sendall(FrameProtocol.encode_message(b"Hello response"))
 
-        while True:
-            # Read message length (4 bytes)
-            raw_msglen = self._recv_all(socket, 4)
-            if not raw_msglen:
-                break
-            
-            msglen = struct.unpack('>I', raw_msglen)[0]
-            # Read the message data
-            data = self._recv_all(socket, msglen)
-            if not data:
-                break
+    def _handle_handshake(self, conn: socket.socket, address: tuple):
+        print("Handshake handler executed")
+        conn.sendall(FrameProtocol.encode_message(b"Handshake response"))
 
-            message = data.decode()
-            print(f"[!] Received: {message}")
-            
-            # Send response with length prefix
-            response = data
-            socket.sendall(struct.pack('>I', len(response)) + response)
+    def handle_client(self, conn: socket.socket, address: tuple):
+        print(f"[+] Connection from {address}")
+        try:
+            while True:
+                data = FrameProtocol.receive_message(conn)
+                if not data:
+                    break
 
-            self.router.handle_request(message, socket, address)
-
-        print(f"[-] Disconnected from {address}")
-        socket.close()
+                message = data.decode(FrameProtocol.ENCODING)
+                print(f"[*] Received: {message}")
+                # Pass only the message as route, conn and address as args
+                response = self.router.handle(message, conn, address)
+                if response:  # Only send if handler returned something
+                    conn.sendall(FrameProtocol.encode_message(response.encode()))
+        finally:
+            print(f"[-] Disconnected {address}")
+            conn.close()
 
     def start(self):
+        print(f"[*] Listening on {self.host}:{self.port}")  # Moved before bind
         self.server_socket.bind((self.host, self.port))
         self.server_socket.listen()
         self.running = True
 
-        print(f"[*] Server listening on {self.host}:{self.port}")
-
         while self.running:
             try:
-                sock, addr = self.server_socket.accept()
-                client_thread = threading.Thread(target=self.handle_client, args=(sock, addr))
-                client_thread.start()
+                conn, addr = self.server_socket.accept()
+                threading.Thread(
+                    target=self.handle_client,
+                    args=(conn, addr),
+                    daemon=True
+                ).start()
             except OSError:
                 break
 
@@ -96,62 +127,43 @@ class Server:
         self.running = False
         self.server_socket.close()
 
+
 class Client:
     def __init__(self):
-        self.client_socket = None
-        self._create_socket()
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 
-    def _create_socket(self):
-        self.client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    def connect(self, host: str, port: int):
+        self.sock.connect((host, port))
 
-    def _recv_all(self, sock, n):
-        data = bytearray()
-        while len(data) < n:
-            packet = sock.recv(n - len(data))
-            if not packet:
-                return None
-            data.extend(packet)
-        return data
+    def send(self, message: str):
+        self.sock.sendall(FrameProtocol.encode_message(message.encode()))
 
-    def connect(self, host, port):
-        self.client_socket.connect((host, port))
+    def receive(self) -> Optional[str]:
+        data = FrameProtocol.receive_message(self.sock)
+        return data.decode() if data else None
 
-    def send(self, data):
-        # Prefix each message with a 4-byte length (network byte order)
-        self.client_socket.sendall(struct.pack('>I', len(data)) + data)
+    def close(self):
+        self.sock.close()
 
-    def receive(self):
-        # Read message length and unpack it into an integer
-        raw_msglen = self._recv_all(self.client_socket, 4)
-        if not raw_msglen:
-            return None
-        msglen = struct.unpack('>I', raw_msglen)[0]
-        # Read the message data
-        data = self._recv_all(self.client_socket, msglen)
-        return data if data else None
 
-    def disconnect(self):
-        self.client_socket.close()
+def main():
+    server = Server("localhost", 8080)
+    server_thread = threading.Thread(target=server.start, daemon=True)
+    server_thread.start()
+    time.sleep(0.5)
 
-# Create and start server
-server = Server('localhost', 8080)
-server_thread = threading.Thread(target=server.start)
-server_thread.start()
+    try:
+        client = Client()
+        client.connect("localhost", 8080)
 
-time.sleep(1)  # Give server time to start
+        for message in ["hello", "handshake", "unknown"]:
+            client.send(message)
+            response = client.receive()
+            print(f"Sent: {message} -> Received: {response}")
+    finally:
+        client.close()
+        server.stop()
+        server_thread.join(timeout=1)
 
-# Run client operations
-client = Client()
-client.connect('localhost', 8080)
-
-client.send("hello".encode())
-print(client.receive().decode())
-
-client.send("handshake".encode())
-print(client.receive().decode())
-
-client.disconnect()
-
-# Clean up server
-server.stop()
-server_thread.join()
+if __name__ == "__main__":
+    main()

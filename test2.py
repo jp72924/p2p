@@ -2,12 +2,11 @@ import json
 import socket
 import struct
 import threading
-import queue
 import time
 import uuid
 import logging
-from abc import ABC, abstractmethod
-from typing import Dict, Set, Tuple, Optional, Callable
+import os
+from typing import Dict, Tuple, Optional, Callable
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.hazmat.backends import default_backend
@@ -29,6 +28,7 @@ class ConnectionManager:
         self.peers: Dict[Tuple[str, int], socket.socket] = {}
         self.lock = threading.Lock()
         self.running = False
+        self.auth = None  # Will be set by PeerNode
 
     def start(self):
         self.running = True
@@ -54,25 +54,28 @@ class ConnectionManager:
             self.peers[addr] = sock
         threading.Thread(target=self._handle_messages, args=(sock, addr), daemon=False).start()
 
+    def _remove_peer(self, sock: socket.socket, addr: Tuple[str, int]):
+        with self.lock:
+            if addr in self.peers:
+                del self.peers[addr]
+        if self.auth and addr in self.auth.sessions:  # Clean up Auth sessions
+            del self.auth.sessions[addr]
+        try:
+            sock.close()
+        except Exception:
+            pass
+
     def _handle_messages(self, sock: socket.socket, addr: Tuple[str, int]):
         while self.running:
             try:
-                data = self._receive_message(sock)
+                data = FrameProtocol.receive(sock)  # Use FrameProtocol directly
                 if data:
                     logger.info(f"Received from {addr}: {data.decode()}")
+                    MessageRouter.dispatch(data, addr)  # ADD THIS LINE
             except Exception as e:
                 logger.error(f"Message handling error: {str(e)}")
+                self._remove_peer(sock, addr)  # Handle cleanup
                 break
-
-    def _receive_message(self, sock: socket.socket) -> Optional[bytes]:
-        try:
-            header = sock.recv(4)
-            if not header:
-                return None
-            length = struct.unpack(">I", header)[0]
-            return sock.recv(length)
-        except Exception:
-            return None
 
     def broadcast(self, data: dict, exclude: Tuple[str, int] = None):
         """Send message to all connected peers except specified one"""
@@ -85,6 +88,10 @@ class ConnectionManager:
                     except Exception as e:
                         logger.error(f"Broadcast failed to {addr}: {str(e)}")
                         self._remove_peer(sock, addr)
+
+    def get_active_peers(self):
+        with self.lock:
+            return list(self.peers.keys())
 
     def connect(self, peer: Tuple[str, int], max_retries: int = 3, retry_delay: float = 1.0):
         for attempt in range(max_retries):
@@ -99,6 +106,7 @@ class ConnectionManager:
                     logger.error(f"Connection failed to {peer} after {max_retries} attempts: {str(e)}")
                 else:
                     logger.warning(f"Connection attempt {attempt + 1} failed, retrying...")
+                    retry_delay *= 2  # Exponential backoff
                     time.sleep(retry_delay)
 
     def stop(self):
@@ -149,24 +157,44 @@ class MessageRouter:
             handler = cls._handlers.get(data.get('type'), cls._default_handler)
             handler(data, source)
         except Exception as e:
-            logging.error(f"Message processing error: {str(e)}")
+            logger.error(f"Message processing error: {str(e)}")  # Use configured logger
 
     @staticmethod
     def _default_handler(data: dict, source: Tuple[str, int]):
-        logging.warning(f"No handler for message type: {data.get('type')}")
+        logger.warning(f"No handler for message type: {data.get('type')}")
+
+    @classmethod
+    def _validation_middleware(cls, data: dict, source: tuple) -> Optional[dict]:
+        required_fields = {
+            'HELLO': ['node_id'],
+            'CHALLENGE': ['challenge'],
+            'RESPONSE': ['response'],
+            'MESSAGE': ['payload', 'id']
+        }
+        
+        msg_type = data.get('type')
+        if not msg_type or msg_type not in required_fields:
+            return None
+            
+        if not all(field in data for field in required_fields[msg_type]):
+            logger.warning(f"Invalid {msg_type} message from {source}")
+            return None
+            
+        return data
 
 # ------------ Security Components ------------
 @dataclass
 class Session:
-    peer_id: str
     socket: socket.socket
     challenge: Optional[bytes] = None
     authenticated: bool = False
 
+
 class AuthProtocol:
-    def __init__(self, network_secret: str):
+    def __init__(self, network_secret: str, conn_mgr: ConnectionManager):  # Add ConnectionManager
         self.network_secret = network_secret.encode()
         self.sessions: Dict[Tuple[str, int], Session] = {}
+        self.conn_mgr = conn_mgr  # Reference to ConnectionManager
 
     def _create_challenge(self) -> bytes:
         return HKDF(
@@ -177,20 +205,40 @@ class AuthProtocol:
             backend=default_backend()
         ).derive(self.network_secret)
 
+    def _create_response(self, challenge: bytes) -> bytes:
+        return HKDF(
+            algorithm=hashes.SHA256(),
+            length=32,
+            salt=challenge,
+            info=b'response',
+            backend=default_backend()
+        ).derive(self.network_secret)
+
     def handle_handshake(self, data: dict, source: Tuple[str, int]):
         if data['type'] == 'HELLO':
-            session = Session(peer_id=data['node_id'], socket=None)
-            session.challenge = self._create_challenge()
-            self.sessions[source] = session
-            FrameProtocol.send(source.socket, json.dumps({
-                'type': 'CHALLENGE',
-                'challenge': session.challenge.hex()
-            }).encode())
+            with self.conn_mgr.lock:
+                sock = self.conn_mgr.peers.get(source)
+            if sock:
+                session = Session(socket=sock)
+                session.challenge = self._create_challenge()
+                self.sessions[source] = session
+                
+                # Send challenge and include our own node ID
+                FrameProtocol.send(sock, json.dumps({
+                    'type': 'CHALLENGE',
+                    'challenge': session.challenge.hex(),
+                    'node_id': self.conn_mgr.node_id  # Add this line
+                }).encode())
 
         elif data['type'] == 'RESPONSE':
             session = self.sessions.get(source)
             if session and self._verify_response(session, data['response']):
                 session.authenticated = True
+                # Send AUTH_SUCCESS to confirm
+                FrameProtocol.send(session.socket, json.dumps({
+                    'type': 'AUTH_SUCCESS',
+                    'message': 'Authentication successful'
+                }).encode())
 
     def _verify_response(self, session: Session, response: str) -> bool:
         expected = HKDF(
@@ -203,34 +251,49 @@ class AuthProtocol:
         return expected == bytes.fromhex(response)
 
     def handle_challenge(self, data: dict, source: Tuple[str, int]):
-        if data['type'] == 'CHALLENGE':
+        if data['type'] == 'CHALLENGE' and source in self.sessions:
             challenge = bytes.fromhex(data['challenge'])
             response = self._create_response(challenge)
+            session = self.sessions[source]
             
+            # Send response and expect AUTH_SUCCESS
             FrameProtocol.send(
-                self.sessions[source].socket,
+                session.socket,
                 json.dumps({
                     'type': 'RESPONSE',
-                    'response': response.hex()
+                    'response': response.hex(),
+                    'node_id': self.conn_mgr.node_id  # Add this line
                 }).encode()
             )
+
+    def handle_auth_success(self, data: dict, source: Tuple[str, int]):
+        session = self.sessions.get(source)
+        if session:
+            session.authenticated = True
+            logger.info(f"Authenticated with {source}")
 
 # ------------ Application Layer ------------
 class PeerDiscoveryProtocol:
     @staticmethod
-    def handle_discovery(data: dict, source: Tuple[str, int]):
+    def handle_discovery(data: dict, source: Tuple[str, int], conn_mgr: ConnectionManager):
         if data['type'] == 'PEER_LIST_REQUEST':
-            peers = ConnectionManager.get_active_peers()
-            FrameProtocol.send(source.socket, json.dumps({
-                'type': 'PEER_LIST',
-                'peers': list(peers)
-            }).encode())
+            peers = conn_mgr.get_active_peers()
+            with conn_mgr.lock:
+                sock = conn_mgr.peers.get(source)
+            if sock:
+                FrameProtocol.send(sock, json.dumps({
+                    'type': 'PEER_LIST',
+                    'peers': list(peers)
+                }).encode())
 
 class MessageForwardingProtocol:
     @staticmethod
     def handle_message(data: dict, source: Tuple[str, int], conn_mgr: ConnectionManager):
-        if data['type'] == 'MESSAGE':
-            conn_mgr.broadcast(data, exclude=source)
+        try:
+            if data['type'] == 'MESSAGE':
+                conn_mgr.broadcast(data, exclude=source)
+        except KeyError:
+            logger.error("Invalid message format received")
 
 # ------------ Main Node Class ------------
 class PeerNode:
@@ -241,42 +304,61 @@ class PeerNode:
 
         # Initialize core components
         self.conn_mgr = ConnectionManager(host, port)
-        self.auth = AuthProtocol(config['network_secret'])
+        self.auth = AuthProtocol(config['network_secret'], self.conn_mgr)
         
         # Register protocols
         MessageRouter.register_handler('HELLO', self.auth.handle_handshake)
-        MessageRouter.register_handler('PEER_LIST_REQUEST', PeerDiscoveryProtocol.handle_discovery)
-        MessageRouter.register_handler('MESSAGE', MessageForwardingProtocol.handle_message)
+        MessageRouter.register_handler('AUTH_SUCCESS', self.auth.handle_auth_success)
+        MessageRouter.register_handler(
+            'PEER_LIST_REQUEST', 
+            lambda data, src: PeerDiscoveryProtocol.handle_discovery(data, src, self.conn_mgr)
+        )
+        MessageRouter.register_handler(
+            'MESSAGE', 
+            lambda data, src: MessageForwardingProtocol.handle_message(data, src, self.conn_mgr)
+        )
 
         # Add middleware
         MessageRouter.add_middleware(self._auth_middleware)
+        MessageRouter.add_middleware(MessageRouter._validation_middleware)
 
         self.node_id = f"{host}:{port}"
         MessageRouter.register_handler('CHALLENGE', self.auth.handle_challenge)
 
     def _auth_middleware(self, data: dict, source: Tuple[str, int]) -> Optional[dict]:
-        if not self.auth.sessions.get(source).authenticated:
+        if data.get('__internal__') or data.get('type') in ['HELLO', 'CHALLENGE', 'RESPONSE']:
+            return data
+        session = self.auth.sessions.get(source)
+        if not session or not session.authenticated:
+            logger.warning(f"Unauthenticated message from {source}")
             return None
         return data
 
-    def _send_handshake(self):
-        """Send initial HELLO message on connection"""
-        handshake = {
-            'type': 'HELLO',
-            'node_id': self.node_id,
-            'timestamp': time.time()
-        }
-        self.send_message(handshake)
+    def _send_handshake(self, peer: Tuple[str, int]):
+        """Send handshake to specific peer"""
+        with self.conn_mgr.lock:
+            sock = self.conn_mgr.peers.get(peer)
+        if sock:
+            # Create session for the peer
+            session = Session(socket=sock)
+            self.auth.sessions[peer] = session
+            handshake = {
+                'type': 'HELLO',
+                'node_id': self.node_id,
+                'timestamp': time.time()
+            }
+            FrameProtocol.send(sock, json.dumps(handshake).encode())
 
     def connect(self, peer: Tuple[str, int]):
         """Override ConnectionManager connect to add handshake"""
-        super().connect(peer)
-        self._send_handshake()
+        self.conn_mgr.connect(peer)
+        self._send_handshake(peer)
 
     def start(self):
         self.conn_mgr.start()
         for peer in self.config['bootstrap_peers']:
-            self.conn_mgr.connect(peer)
+            if peer != (self.host, self.port):  # Prevent self-connection
+                self.connect(peer)
 
     def stop(self):
         self.conn_mgr.stop()
@@ -285,19 +367,25 @@ class PeerNode:
         MessageForwardingProtocol.handle_message({
             'type': 'MESSAGE',
             'payload': message,
-            'id': str(uuid.uuid4())
-        }, None, self.conn_mgr)  # Pass ConnectionManager instance
+            'id': str(uuid.uuid4()),
+            '__internal__': True  # Skip auth middleware
+        }, (self.host, self.port), self.conn_mgr)
 
 
 if __name__ == "__main__":
-    config = {
+    config1 = {
         'network_secret': 'my-secure-network-key',
-        'bootstrap_peers': [('127.0.0.1', 6000)]
+        'bootstrap_peers': []
+    }
+
+    config2 = {
+        'network_secret': 'my-secure-network-key',
+        'bootstrap_peers': [('127.0.0.1', 8000)]
     }
 
     # Create and start two peer nodes
-    node1 = PeerNode('127.0.0.1', 6000, config)
-    node2 = PeerNode('127.0.0.1', 6001, config)
+    node1 = PeerNode('127.0.0.1', 8000, config1)
+    node2 = PeerNode('127.0.0.1', 8001, config2)
     
     node1.start()
     time.sleep(1)  # Let node1 fully initialize

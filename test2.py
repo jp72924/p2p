@@ -166,18 +166,26 @@ class MessageRouter:
     @classmethod
     def _validation_middleware(cls, data: dict, source: tuple) -> Optional[dict]:
         required_fields = {
-            'HELLO': ['node_id'],
-            'CHALLENGE': ['challenge'],
-            'RESPONSE': ['response'],
-            'MESSAGE': ['payload', 'id']
+            'HELLO': ['node_id', 'timestamp'],
+            'CHALLENGE': ['challenge', 'node_id'],
+            'RESPONSE': ['response', 'node_id'],
+            'MESSAGE': ['payload', 'id'],
+            'PEER_LIST_REQUEST': [],
+            'PEER_LIST': ['peers'],
+            'AUTH_SUCCESS': ['message']
         }
         
         msg_type = data.get('type')
-        if not msg_type or msg_type not in required_fields:
+        if not msg_type:
+            logger.warning(f"Message from {source} missing type field")
+            return None
+            
+        if msg_type not in required_fields:
+            logger.warning(f"Unknown message type '{msg_type}' from {source}")
             return None
             
         if not all(field in data for field in required_fields[msg_type]):
-            logger.warning(f"Invalid {msg_type} message from {source}")
+            logger.warning(f"Invalid {msg_type} message from {source} - missing required fields")
             return None
             
         return data
@@ -215,6 +223,7 @@ class AuthProtocol:
         ).derive(self.network_secret)
 
     def handle_handshake(self, data: dict, source: Tuple[str, int]):
+        logger.debug(f"Handling handshake message: {data} from {source}")
         if data['type'] == 'HELLO':
             with self.conn_mgr.lock:
                 sock = self.conn_mgr.peers.get(source)
@@ -251,6 +260,7 @@ class AuthProtocol:
         return expected == bytes.fromhex(response)
 
     def handle_challenge(self, data: dict, source: Tuple[str, int]):
+        logger.debug(f"Handling challenge message: {data} from {source}")
         if data['type'] == 'CHALLENGE' and source in self.sessions:
             challenge = bytes.fromhex(data['challenge'])
             response = self._create_response(challenge)
@@ -302,58 +312,119 @@ class DeduplicationMiddleware:
 
     def __call__(self, data: dict, source: Tuple[str, int]) -> Optional[dict]:
         """Middleware function to filter duplicates."""
+        msg_type = data.get('type')
+        # Skip ID check for handshake and auth messages
+        if msg_type in ['HELLO', 'CHALLENGE', 'RESPONSE', 'AUTH_SUCCESS']:
+            return data
+            
         msg_id = data.get("id")
         if not msg_id:
             logger.warning(f"Message from {source} missing ID, dropping")
-            return None  # Drop messages without IDs
+            return None
 
         with self.lock:
             if msg_id in self.seen_messages:
                 logger.debug(f"Duplicate message {msg_id[:8]} from {source}, dropping")
-                return None  # Skip duplicates
-            self.seen_messages.add(msg_id)  # Track new messages
+                return None
+            self.seen_messages.add(msg_id)
 
-        return data  # Pass non-duplicates downstream
+        return data
 
 # ------------ Main Node Class ------------
 class PeerNode:
     def __init__(self, host: str, port: int, config: dict):
+        """
+        Initialize a PeerNode with core components and message handlers.
+        
+        Args:
+            host: The host address to bind to
+            port: The port to listen on
+            config: Configuration dictionary containing:
+                - network_secret: Shared secret for authentication
+                - bootstrap_peers: List of (host, port) tuples to connect to initially
+        """
         self.host = host
         self.port = port
         self.config = config
-
+        
         # Initialize core components
         self.conn_mgr = ConnectionManager(host, port)
+        self.conn_mgr.node_id = f"{host}:{port}"  # Set node ID for connection manager
+        self.conn_mgr.auth = self  # Reference back for auth cleanup
+        
+        # Initialize security components
         self.auth = AuthProtocol(config['network_secret'], self.conn_mgr)
         self.deduplicator = DeduplicationMiddleware()
+        
+        # Set node identifier
+        self.node_id = f"{host}:{port}"
+        
+        # Register message handlers
+        self._register_message_handlers()
+        
+        # Add middleware in correct order
+        self._setup_middleware()
+        
+        # Track active connections
+        self.active_connections = set()
 
-        # Register protocols
+    def _register_message_handlers(self):
+        """Register all message handlers with the MessageRouter"""
+        # Authentication protocol handlers
         MessageRouter.register_handler('HELLO', self.auth.handle_handshake)
+        MessageRouter.register_handler('CHALLENGE', self.auth.handle_challenge)
+        MessageRouter.register_handler('RESPONSE', self.auth.handle_handshake)
         MessageRouter.register_handler('AUTH_SUCCESS', self.auth.handle_auth_success)
+        
+        # Peer discovery handlers
         MessageRouter.register_handler(
-            'PEER_LIST_REQUEST', 
+            'PEER_LIST_REQUEST',
             lambda data, src: PeerDiscoveryProtocol.handle_discovery(data, src, self.conn_mgr)
         )
+        
+        # Message forwarding handler
         MessageRouter.register_handler(
-            'MESSAGE', 
+            'MESSAGE',
             lambda data, src: MessageForwardingProtocol.handle_message(data, src, self.conn_mgr)
         )
+        
+        # Add any additional custom handlers here
+        # MessageRouter.register_handler('CUSTOM_TYPE', self.handle_custom_type)
 
-        # Add middleware
-        MessageRouter.add_middleware(self.deduplicator)  # Runs FIRST
-        MessageRouter.add_middleware(self._auth_middleware)
+    def _setup_middleware(self):
+        """Configure middleware pipeline in correct processing order"""
+        # Clear any existing middleware
+        MessageRouter._middleware.clear()
+        
+        # Add middleware in processing order (first added = last executed)
+        
+        # 1. Validation (should run first to catch malformed messages early)
         MessageRouter.add_middleware(MessageRouter._validation_middleware)
-
-        self.node_id = f"{host}:{port}"
-        MessageRouter.register_handler('CHALLENGE', self.auth.handle_challenge)
+        
+        # 2. Authentication (checks auth state after validation)
+        MessageRouter.add_middleware(self._auth_middleware)
+        
+        # 3. Deduplication (should run after auth to avoid processing duplicates)
+        MessageRouter.add_middleware(self.deduplicator)
+        
+        # Add any additional custom middleware here
+        # MessageRouter.add_middleware(self._custom_middleware)
 
     def _auth_middleware(self, data: dict, source: Tuple[str, int]) -> Optional[dict]:
-        if data.get('__internal__') or data.get('type') in ['HELLO', 'CHALLENGE', 'RESPONSE']:
+        """
+        Middleware to enforce authentication for non-handshake messages.
+        Allows internal messages and auth protocol messages to pass through.
+        """
+        # Skip auth check for internal messages and auth protocol messages
+        if data.get('__internal__') or data.get('type') in ['HELLO', 'CHALLENGE', 'RESPONSE', 'AUTH_SUCCESS']:
             return data
+            
+        # Check authentication status
         session = self.auth.sessions.get(source)
         if not session or not session.authenticated:
             logger.warning(f"Unauthenticated message from {source}")
             return None
+            
         return data
 
     def _send_handshake(self, peer: Tuple[str, int]):
@@ -416,11 +487,11 @@ if __name__ == "__main__":
     
     # Send test message after connection
     time.sleep(2)  # Allow handshake to complete
-    node1.send_message({'text': 'Hello Network!'})
     
     try:
         while True:
             time.sleep(1)
+            node1.send_message({'text': 'Hello Network!'})
     except KeyboardInterrupt:
         node1.stop()
         node2.stop()

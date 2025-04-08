@@ -295,6 +295,26 @@ class MessageForwardingProtocol:
         except KeyError:
             logger.error("Invalid message format received")
 
+class DeduplicationMiddleware:
+    def __init__(self):
+        self.seen_messages = set()  # Tracks message IDs
+        self.lock = threading.Lock()  # Thread-safe access
+
+    def __call__(self, data: dict, source: Tuple[str, int]) -> Optional[dict]:
+        """Middleware function to filter duplicates."""
+        msg_id = data.get("id")
+        if not msg_id:
+            logger.warning(f"Message from {source} missing ID, dropping")
+            return None  # Drop messages without IDs
+
+        with self.lock:
+            if msg_id in self.seen_messages:
+                logger.debug(f"Duplicate message {msg_id[:8]} from {source}, dropping")
+                return None  # Skip duplicates
+            self.seen_messages.add(msg_id)  # Track new messages
+
+        return data  # Pass non-duplicates downstream
+
 # ------------ Main Node Class ------------
 class PeerNode:
     def __init__(self, host: str, port: int, config: dict):
@@ -305,7 +325,8 @@ class PeerNode:
         # Initialize core components
         self.conn_mgr = ConnectionManager(host, port)
         self.auth = AuthProtocol(config['network_secret'], self.conn_mgr)
-        
+        self.deduplicator = DeduplicationMiddleware()
+
         # Register protocols
         MessageRouter.register_handler('HELLO', self.auth.handle_handshake)
         MessageRouter.register_handler('AUTH_SUCCESS', self.auth.handle_auth_success)
@@ -319,6 +340,7 @@ class PeerNode:
         )
 
         # Add middleware
+        MessageRouter.add_middleware(self.deduplicator)  # Runs FIRST
         MessageRouter.add_middleware(self._auth_middleware)
         MessageRouter.add_middleware(MessageRouter._validation_middleware)
 

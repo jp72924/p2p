@@ -1,6 +1,7 @@
 import socket
 import threading
 import logging
+from typing import Dict, Tuple
 
 # Configure logging
 logging.basicConfig(level=logging.INFO,
@@ -13,33 +14,30 @@ class ThreadedTCPServer:
         self.server_socket = None
         self.running = False
         self.client_threads = []
+        self.active_connections: Dict[Tuple[str, int], socket.socket] = {}
+        self.lock = threading.Lock()
 
     def start(self):
         """Start the TCP server and listen for incoming connections."""
         try:
-            # Create a TCP socket
             self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            
-            # Enable address reuse
             self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            
-            # Bind to the specified host and port
             self.server_socket.bind((self.host, self.port))
-            
-            # Listen for incoming connections (backlog of 5)
             self.server_socket.listen(5)
             
             logging.info(f"Server started on {self.host}:{self.port}")
             self.running = True
             
-            # Main server loop
             while self.running:
                 try:
-                    # Accept a new connection
                     client_socket, client_address = self.server_socket.accept()
                     logging.info(f"New connection from {client_address}")
                     
-                    # Create a new thread to handle the client
+                    # Add to active connections
+                    with self.lock:
+                        self.active_connections[client_address] = client_socket
+                    
+                    # Start client thread
                     client_thread = threading.Thread(
                         target=self.handle_client,
                         args=(client_socket, client_address),
@@ -57,30 +55,51 @@ class ThreadedTCPServer:
         finally:
             self.stop()
 
-    def handle_client(self, client_socket, client_address):
+    def handle_client(self, client_socket: socket.socket, client_address: Tuple[str, int]):
         """Handle communication with a connected client."""
         try:
             while self.running:
-                # Receive data from the client (max 1024 bytes)
                 data = client_socket.recv(1024)
                 if not data:
                     break  # Client disconnected
                 
-                # Process the received data
                 message = data.decode('utf-8').strip()
                 logging.info(f"Received from {client_address}: {message}")
                 
-                # Prepare a response (echo back in this example)
-                response = f"ECHO: {message}\n"
-                client_socket.sendall(response.encode('utf-8'))
+                # Broadcast message to all other clients
+                self.broadcast_message(message, exclude_client=client_address)
                 
         except ConnectionResetError:
             logging.info(f"Client {client_address} disconnected abruptly")
         except Exception as e:
             logging.error(f"Error with client {client_address}: {e}")
         finally:
+            # Remove from active connections
+            with self.lock:
+                if client_address in self.active_connections:
+                    del self.active_connections[client_address]
+            
             client_socket.close()
             logging.info(f"Connection with {client_address} closed")
+
+    def broadcast_message(self, message: str, exclude_client: Tuple[str, int] = None):
+        """Send a message to all connected clients except the excluded one."""
+        with self.lock:
+            for address, sock in list(self.active_connections.items()):
+                if address == exclude_client:
+                    continue
+                
+                try:
+                    formatted_message = f"[BROADCAST] {message}\n"
+                    sock.sendall(formatted_message.encode('utf-8'))
+                except (ConnectionError, OSError) as e:
+                    logging.error(f"Error sending to {address}: {e}")
+                    # Remove disconnected client
+                    del self.active_connections[address]
+                    try:
+                        sock.close()
+                    except:
+                        pass
 
     def stop(self):
         """Stop the server and clean up resources."""
@@ -90,21 +109,29 @@ class ThreadedTCPServer:
         self.running = False
         logging.info("Shutting down server...")
         
-        # Close the server socket
+        # Close all client connections
+        with self.lock:
+            for sock in self.active_connections.values():
+                try:
+                    sock.close()
+                except:
+                    pass
+            self.active_connections.clear()
+        
+        # Close server socket
         if self.server_socket:
             try:
                 self.server_socket.close()
             except Exception as e:
                 logging.error(f"Error closing server socket: {e}")
         
-        # Wait for all client threads to finish
+        # Wait for client threads
         for thread in self.client_threads:
             thread.join(timeout=1)
         
         logging.info("Server shutdown complete")
 
 if __name__ == "__main__":
-    # Create and start the server
     server = ThreadedTCPServer(host='0.0.0.0', port=5000)
     
     try:

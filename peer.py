@@ -4,11 +4,57 @@ import logging
 import json
 import time
 import uuid
+import struct
 from typing import Dict, Tuple, Set, Optional, Callable
 
 # Configure logging
 logging.basicConfig(level=logging.INFO,
                    format='%(asctime)s - %(levelname)s - %(message)s')
+
+class FrameProtocol:
+    """Generic message framing with 4-byte length prefix (big-endian)"""
+    HEADER_SIZE = 4  # Bytes for message length
+    ENCODING = "utf-8"
+
+    @staticmethod
+    def encode(data: str) -> bytes:
+        """Convert string to framed bytes (length + payload)"""
+        data_bytes = data.encode(FrameProtocol.ENCODING)
+        return struct.pack(">I", len(data_bytes)) + data_bytes
+
+    @staticmethod
+    def decode(raw: bytes) -> str:
+        """Extract string from framed bytes"""
+        return raw.decode(FrameProtocol.ENCODING)
+
+    @classmethod
+    def read_message(cls, sock: socket.socket) -> Optional[str]:
+        """Read full message from socket using framing"""
+        try:
+            # Read header
+            header = cls._recv_exact(sock, cls.HEADER_SIZE)
+            if not header:
+                return None
+            
+            # Extract payload length
+            payload_len = struct.unpack(">I", header)[0]
+            
+            # Read payload
+            payload = cls._recv_exact(sock, payload_len)
+            return cls.decode(payload) if payload else None
+        except (ConnectionError, struct.error):
+            return None
+
+    @staticmethod
+    def _recv_exact(sock: socket.socket, n: int) -> Optional[bytes]:
+        """Read exactly `n` bytes from socket"""
+        data = bytearray()
+        while len(data) < n:
+            chunk = sock.recv(n - len(data))
+            if not chunk:
+                return None
+            data.extend(chunk)
+        return bytes(data)
 
 class MessageProcessor:
     """Handles different types of messages with registered handlers"""
@@ -98,19 +144,23 @@ class NetworkServer:
         self.message_processor.register_handler("ping", self._handle_ping)
         self.message_processor.register_handler("broadcast", self._handle_broadcast)
 
-    def broadcast_message(self, message: dict, exclude_address: Optional[Tuple[str, int]] = None):
+    def broadcast_message(self, message: dict, exclude_address: Optional[Tuple[str, int]] = None) -> int:
         """
-        Broadcast a message with automatic ID generation and deduplication.
+        Broadcast a framed message to all connected peers with deduplication.
+        Returns number of successful transmissions.
         
         Args:
-            message: Dictionary containing the message to broadcast
+            message: Dictionary containing the message payload
             exclude_address: Optional (host, port) tuple to exclude from broadcast
+            
+        Returns:
+            int: Number of peers successfully sent the message
         """
         if not isinstance(message, dict):
             logging.error("Broadcast message must be a dictionary (got %s)", type(message))
-            return
+            return 0
 
-        # Ensure message has required fields
+        # 1. Prepare the message with required fields
         message.setdefault('type', 'broadcast')
         if 'message_id' not in message:
             message['message_id'] = str(uuid.uuid4())
@@ -121,31 +171,46 @@ class NetworkServer:
         if 'hops' not in message:
             message['hops'] = 0
 
-        # Add to seen messages before broadcasting
+        # 2. Deduplication setup
         with self.dedup_lock:
+            if message['message_id'] in self.seen_message_ids:
+                logging.debug(f"Message {message['message_id']} already broadcasted")
+                return 0
+                
             self.seen_message_ids.add(message['message_id'])
-            # Clean up old messages if needed
+            # Rotate seen messages if exceeds limit
             if len(self.seen_message_ids) > self.max_seen_messages:
                 self.seen_message_ids = set(list(self.seen_message_ids)[-self.max_seen_messages:])
 
-        # Actual broadcasting
-        with self.lock:
+        # 3. Convert to framed message (once, for efficiency)
+        try:
+            message_str = json.dumps(message)
+            framed_data = FrameProtocol.encode(message_str)
+        except (TypeError, json.JSONEncodeError) as e:
+            logging.error(f"Failed to serialize broadcast message: {e}")
+            return 0
+
+        # 4. Send to all active connections
+        sent_count = 0
+        with self.lock:  # Protect connections during iteration
             connections = list(self.incoming_connections.items()) + list(self.outgoing_connections.items())
 
-        sent_count = 0
         for address, sock in connections:
             if exclude_address and address == exclude_address:
                 continue
-                    
+                
             try:
-                data = json.dumps(message) + "\n"
-                sock.sendall(data.encode('utf-8'))
+                sock.sendall(framed_data)  # Atomic framed send
                 sent_count += 1
+                logging.debug(f"Sent broadcast to {address}")
             except (ConnectionError, OSError) as e:
-                logging.error(f"Failed to broadcast to {address}: {e}")
-                self._cleanup_connection(sock, address)
-                    
-        logging.debug(f"Broadcasted message {message['message_id']} to {sent_count} peers")
+                logging.warning(f"Broadcast failed to {address}: {e}")
+                with self.lock:
+                    self._cleanup_connection(sock, address)
+
+        # 5. Log results and return
+        logging.info(f"Broadcast {message['message_id']} reached {sent_count}/{len(connections)} peers")
+        return sent_count
 
     def _handle_broadcast(self, message: dict, connection: Tuple[str, int], server: 'NetworkServer'):
         """
@@ -263,24 +328,16 @@ class NetworkServer:
     def _handle_connection(self, sock: socket.socket, address: Tuple[str, int]):
         """Handle incoming connection lifecycle"""
         try:
-            # Initial message must be port announcement
-            data = sock.recv(1024)
-            if not data:
-                return
-                
-            self.message_processor.process_message(data.decode(), address, self)
-            
-            # Continue normal message handling
+            # Read framed messages
             while self.running:
-                data = sock.recv(1024)
-                if not data:
+                message_str = FrameProtocol.read_message(sock)
+                if not message_str:
                     break
-                self.message_processor.process_message(data.decode(), address, self)
                 
-        except (ConnectionResetError, BrokenPipeError):
-            logging.info(f"Connection reset by {address}")
+                self.message_processor.process_message(message_str, address, self)
+                
         except Exception as e:
-            logging.error(f"Connection handler error: {e}")
+            logging.error(f"Connection error: {e}")
         finally:
             self._cleanup_connection(sock, address)
 
@@ -336,17 +393,19 @@ class NetworkServer:
     def send_message(self, address: Tuple[str, int], message: dict):
         """Send message to a specific connection"""
         with self.lock:
-            sock = self.outgoing_connections.get(address) or self.incoming_connections.get(address)
+            sock = self.outgoing_connections.get(address) or \
+                   self.incoming_connections.get(address)
         
         if not sock:
             logging.error(f"No connection to {address}")
             return
 
         try:
-            data = json.dumps(message) + "\n"
-            sock.sendall(data.encode('utf-8'))
-        except (ConnectionError, BrokenPipeError) as e:
-            logging.error(f"Send error to {address}: {e}")
+            # Convert to framed bytes
+            message_str = json.dumps(message)
+            framed_data = FrameProtocol.encode(message_str)
+            sock.sendall(framed_data)
+        except (ConnectionError, json.JSONDecodeError) as e:
             self._cleanup_connection(sock, address)
 
     def _cleanup_connection(self, sock: socket.socket, address: Tuple[str, int]):
@@ -421,11 +480,6 @@ if __name__ == "__main__":
     try:
         while True:
             # Server administration could be added here
-            # Send broadcast
-            server.send_public_message("Hello network!")
-
-            # Or with custom message
-            server.broadcast_message({"type": "ping"})
-            time.sleep(2)
+            time.sleep(5)
     except KeyboardInterrupt:
         server.stop()

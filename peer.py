@@ -6,6 +6,7 @@ import time
 import uuid
 import struct
 from typing import Dict, Tuple, Set, Optional, Callable
+import random
 
 # Configure logging
 logging.basicConfig(level=logging.INFO,
@@ -102,7 +103,6 @@ class MessageProcessor:
             "sender": f"{connection[0]}:{connection[1]}",
             "content": content,
             "timestamp": time.time(),
-            "hops": 0,
         }
 
         # Add to seen messages before processing
@@ -168,8 +168,6 @@ class NetworkServer:
             message['sender'] = f"{self.host}:{self.port}"
         if 'timestamp' not in message:
             message['timestamp'] = time.time()
-        if 'hops' not in message:
-            message['hops'] = 0
 
         # 2. Deduplication setup
         with self.dedup_lock:
@@ -229,12 +227,6 @@ class NetworkServer:
                 return
             self.seen_message_ids.add(message['message_id'])
 
-        # Hop limit check (configurable)
-        message['hops'] = message.get('hops', 0) + 1
-        if message['hops'] > 15:
-            logging.debug(f"Message {message['message_id']} exceeded hop limit")
-            return
-
         # Process message locally first
         self._process_received_broadcast(message)
 
@@ -243,7 +235,7 @@ class NetworkServer:
 
     def _process_received_broadcast(self, message: dict):
         """Handle a received broadcast message locally"""
-        logging.info(f"Received broadcast [{message['message_id']}] (hops={message['hops']}): {message.get('content', '')}")
+        logging.info(f"Received broadcast [{message['message_id']}]: {message.get('content', '')}")
         # Add your application-specific broadcast handling here
 
     def send_public_message(self, content: str):
@@ -480,6 +472,8 @@ if __name__ == "__main__":
     try:
         while True:
             # Server administration could be added here
-            time.sleep(5)
+            time.sleep(5)  # Reduce CPU usage
+            if random.random() > 0.5:  # Randomize broadcasts
+                server.send_public_message(f"Status update {time.time()}")
     except KeyboardInterrupt:
         server.stop()

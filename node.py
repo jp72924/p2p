@@ -6,7 +6,79 @@ import queue
 import time
 import uuid
 from itertools import chain
-from typing import List, Tuple, Dict, Set
+from typing import List, Tuple, Dict, Set, Callable
+
+class MessageRouter:
+    def __init__(self, node: 'PeerNode'):
+        self.node = node
+        self.handlers: Dict[str, Callable] = {}
+        self.middleware: List[Callable] = []
+        self.default_handler = self._forward_message
+
+    def add_handler(self, message_type: str, handler: Callable):
+        """Register handler for a specific message type"""
+        with self.node.message_dedup_lock:  # Reuse existing lock
+            self.handlers[message_type] = handler
+
+    def add_middleware(self, middleware_func: Callable):
+        """Add pre-processing step (e.g., validation, logging)"""
+        self.middleware.append(middleware_func)
+
+    def route_message(self, message: dict, sender_sock: socket.socket):
+        """Process incoming message through pipeline"""
+        try:
+            # Deserialize and deduplicate
+            msg_id = message.get('id')
+            msg_type = message.get('type', 'unknown')
+
+            # Deduplication check
+            with self.node.message_dedup_lock:
+                if msg_id in self.node.seen_messages:
+                    return
+                self.node.seen_messages.add(msg_id)
+
+            # Apply middleware (e.g., logging, validation)
+            for middleware in self.middleware:
+                message = middleware(message) or message
+
+            # Route to handler or forward
+            handler = self.handlers.get(msg_type, self.default_handler)
+            should_forward = handler(message, sender_sock)
+            
+            # Forward if handler allows
+            if should_forward:
+                self._forward_message(message, sender_sock)
+
+        except json.JSONDecodeError:
+            print(f"Malformed message: {raw_message[:100]}")
+
+    def _forward_message(self, message: dict, exclude_sock: socket.socket) -> bool:
+        """Default handler: forward message to all peers except sender"""
+        self.node._broadcast_message(message, exclude_sock)
+        return False  # Prevent re-forwarding loops
+
+class HelloHandler:
+    def __init__(self, node: 'PeerNode'):
+        self.node = node
+
+    def __call__(self, message: dict, sender_sock: socket.socket) -> bool:
+        """Process HELLO messages (peer discovery)"""
+        listen_port = message.get('listen_port')
+        if not listen_port:
+            return False
+
+        # Extract sender IP from socket
+        with self.node.connection_lock:
+            sender_ip = self.node.inbound_connections.get(sender_sock, ("", 0))[0]
+
+        new_peer = (sender_ip, listen_port)
+        with self.node.peer_list_lock:
+            if new_peer not in self.node.bootstrap_peers:
+                self.node.bootstrap_peers.add(new_peer)
+                print(f"Discovered peer: {new_peer}")
+
+        return False  # Do NOT forward HELLO messages
+
 
 class PeerNode:
     def __init__(self, host: str, port: int, bootstrap_peers: list, node_id: str = None):
@@ -30,6 +102,9 @@ class PeerNode:
 
         self.message_inbox = queue.Queue()
         self.message_outbox = queue.Queue()
+
+        self.router = MessageRouter(self)
+        self.router.add_handler("HELLO", HelloHandler(self))
 
         # Start core threads
         threading.Thread(target=self._listen_for_peers, daemon=True).start()
@@ -94,48 +169,10 @@ class PeerNode:
     def _handle_peer_messages(self):
         while self.running:
             try:
-                message, sender_sock, conn_type = self.message_inbox.get(timeout=1)
-                
-                # Message deduplication
-                msg_id = message.get('id')
-                if not msg_id:
-                    continue
-                    
-                with self.message_dedup_lock:
-                    if msg_id in self.seen_messages:
-                        continue
-                    self.seen_messages.add(msg_id)
-
-                # Handle HELLO protocol
-                if message.get('type') == "HELLO":
-                    listen_port = message.get('listen_port')
-                    if not listen_port:
-                        continue
-
-                    # Get sender's IP from connection info
-                    with self.connection_lock:
-                        if conn_type == "incoming":
-                            sender_ip = self.inbound_connections.get(sender_sock, ("", 0))[0]
-                        else:
-                            sender_ip = self.outbound_connections.get(sender_sock, ("", 0))[0]
-
-                    new_peer = (sender_ip, listen_port)
-                    
-                    # Add to known peers if not present
-                    with self.peer_list_lock:
-                        if new_peer not in self.bootstrap_peers:
-                            self.bootstrap_peers.add(new_peer)
-                            print(f"[{self.node_id}] Discovered new peer: {new_peer[0]}:{new_peer[1]}")
-
-                # Forward other messages
-                else:
-                    forward_count = self._broadcast_message(message, exclude_sock=sender_sock)
-                    print(f"[{self.node_id}] Forwarded message {msg_id[:8]} to {forward_count} peers")
-
+                raw_msg, sender_sock, _ = self.message_inbox.get(timeout=1)
+                self.router.route_message(raw_msg, sender_sock)
             except queue.Empty:
                 continue
-            except Exception as e:
-                print(f"[{self.node_id}] Message processing error: {e}")
 
     def _dispatch_queued_messages(self):
         while self.running:
@@ -287,7 +324,7 @@ if __name__ == "__main__":
             print("\nCurrent Connection Stats:")
             print(f"Node1: {node1.get_connection_stats()}")
             print(f"Node2: {node2.get_connection_stats()}")
-
+            node1.send_message({"type": "ping"})
     except KeyboardInterrupt:
         node1.shutdown()
         node2.shutdown()

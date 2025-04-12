@@ -6,7 +6,7 @@ import queue
 import time
 import uuid
 from itertools import chain
-from typing import List, Tuple, Dict, Set, Callable
+from typing import List, Tuple, Dict, Set, Callable, Optional
 
 class MessageRouter:
     def __init__(self, node: 'PeerNode'):
@@ -79,6 +79,65 @@ class HelloHandler:
 
         return False  # Do NOT forward HELLO messages
 
+class MessageFramer:
+    """
+    Handles message framing with 4-byte big-endian length prefixes.
+    Stateless and thread-safe (all methods are static).
+    """
+    HEADER_FORMAT = ">I"  # 4-byte unsigned integer (big-endian)
+    HEADER_SIZE = struct.calcsize(HEADER_FORMAT)
+
+    @staticmethod
+    def frame_message(data: bytes) -> bytes:
+        """Add length prefix to raw bytes"""
+        return struct.pack(MessageFramer.HEADER_FORMAT, len(data)) + data
+
+    @staticmethod
+    def deframe_data(buffer: bytes) -> Tuple[Optional[bytes], bytes]:
+        """
+        Attempt to extract a complete message from buffer.
+        Returns (message, remaining_buffer)
+        """
+        if len(buffer) < MessageFramer.HEADER_SIZE:
+            return None, buffer
+
+        payload_len = struct.unpack(
+            MessageFramer.HEADER_FORMAT,
+            buffer[:MessageFramer.HEADER_SIZE]
+        )[0]
+
+        total_needed = MessageFramer.HEADER_SIZE + payload_len
+        if len(buffer) < total_needed:
+            return None, buffer
+
+        message = buffer[MessageFramer.HEADER_SIZE:total_needed]
+        remaining = buffer[total_needed:]
+        return message, remaining
+
+    @staticmethod
+    def recv_message(sock: socket.socket) -> Optional[bytes]:
+        """Receive complete framed message from socket"""
+        try:
+            header = MessageFramer._recv_exact(sock, MessageFramer.HEADER_SIZE)
+            if not header:
+                return None
+
+            payload_len = struct.unpack(MessageFramer.HEADER_FORMAT, header)[0]
+            payload = MessageFramer._recv_exact(sock, payload_len)
+            return payload if payload else None
+        except (ConnectionError, struct.error):
+            return None
+
+    @staticmethod
+    def _recv_exact(sock: socket.socket, n: int) -> Optional[bytes]:
+        """Internal: read exactly n bytes from socket"""
+        data = bytearray()
+        while len(data) < n:
+            chunk = sock.recv(n - len(data))
+            if not chunk:  # EOF
+                return None
+            data.extend(chunk)
+        return bytes(data)
 
 class PeerNode:
     def __init__(self, host: str, port: int, bootstrap_peers: list, node_id: str = None):
@@ -198,8 +257,8 @@ class PeerNode:
                 "id": str(uuid.uuid4())
             }
             data = json.dumps(handshake_message).encode()
-            header = struct.pack('>I', len(data))
-            sock.sendall(header + data)
+            framed = MessageFramer.frame_message(data)
+            sock.sendall(framed)
             
             self._register_peer(sock, (host, port), "outgoing")
             print(f"[{self.node_id}] Sent HELLO to {host}:{port}")
@@ -208,8 +267,7 @@ class PeerNode:
 
     def _broadcast_message(self, message: dict, exclude_sock: socket.socket = None) -> int:
         data = json.dumps(message).encode()
-        header = struct.pack('>I', len(data))
-        full_message = header + data
+        full_message = MessageFramer.frame_message(data)
         count = 0
 
         with self.connection_lock:
@@ -266,16 +324,9 @@ class PeerNode:
     def _handle_connection(self, sock: socket.socket, connection_type: str):
         while self.running:
             try:
-                header = self._receive_exact_bytes(sock, 4)
-                if not header:
-                    break
-
-                length = struct.unpack('>I', header)[0]
-                data = self._receive_exact_bytes(sock, length)
-                if not data:
-                    break
-
-                message = json.loads(data.decode())
+                payload = MessageFramer.recv_message(sock)
+                if payload:
+                    message = json.loads(payload.decode())
                 self.message_inbox.put((message, sock, connection_type))
 
             except Exception as e:
@@ -296,20 +347,6 @@ class PeerNode:
                 self.outbound_connections.values()
             )
             return not any(remote == (host, port) for remote in all_remotes)
-
-    def _receive_exact_bytes(self, sock: socket.socket, n: int) -> bytes:
-        data = bytearray()
-        while len(data) < n and self.running:
-            try:
-                chunk = sock.recv(n - len(data))
-                if not chunk:
-                    return b''
-                data.extend(chunk)
-            except BlockingIOError:
-                continue
-            except Exception:
-                return b''
-        return bytes(data)
 
 
 if __name__ == "__main__":

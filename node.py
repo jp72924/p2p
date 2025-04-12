@@ -1,143 +1,18 @@
 import json
 import socket
-import struct
 import threading
 import queue
 import time
 import uuid
+
 from itertools import chain
-from typing import List, Tuple, Dict, Set, Callable, Optional
+from typing import Tuple
+from router import MessageRouter
+from protocols import MessageFramer
+from handlers import HelloHandler
+from handlers import RequestHandler
+from handlers import ResponseHandler
 
-class MessageRouter:
-    def __init__(self, node: 'PeerNode'):
-        self.node = node
-        self.handlers: Dict[str, Callable] = {}
-        self.middleware: List[Callable] = []
-        self.default_handler = self._forward_message
-
-    def add_handler(self, message_type: str, handler: Callable):
-        """Register handler for a specific message type"""
-        with self.node.message_dedup_lock:  # Reuse existing lock
-            self.handlers[message_type] = handler
-
-    def add_middleware(self, middleware_func: Callable):
-        """Add pre-processing step (e.g., validation, logging)"""
-        self.middleware.append(middleware_func)
-
-    def route_message(self, message: dict, sender_sock: socket.socket):
-        """Process incoming message through pipeline"""
-        try:
-            # Deserialize and deduplicate
-            msg_id = message.get('id')
-            msg_type = message.get('type', 'unknown')
-
-            # Deduplication check
-            with self.node.message_dedup_lock:
-                if msg_id in self.node.seen_messages:
-                    return
-                self.node.seen_messages.add(msg_id)
-
-            # Apply middleware (e.g., logging, validation)
-            for middleware in self.middleware:
-                message = middleware(message) or message
-
-            # Route to handler or forward
-            handler = self.handlers.get(msg_type, self.default_handler)
-            should_forward = handler(message, sender_sock)
-            
-            # Forward if handler allows
-            if should_forward:
-                self._forward_message(message, sender_sock)
-
-        except json.JSONDecodeError:
-            print(f"Malformed message: {raw_message[:100]}")
-
-    def _forward_message(self, message: dict, exclude_sock: socket.socket) -> bool:
-        """Default handler: forward message to all peers except sender"""
-        self.node._broadcast_message(message, exclude_sock)
-        return False  # Prevent re-forwarding loops
-
-class HelloHandler:
-    def __init__(self, node: 'PeerNode'):
-        self.node = node
-
-    def __call__(self, message: dict, sender_sock: socket.socket) -> bool:
-        """Process HELLO messages (peer discovery)"""
-        listen_port = message.get('listen_port')
-        if not listen_port:
-            return False
-
-        # Extract sender IP from socket
-        with self.node.connection_lock:
-            sender_ip = self.node.inbound_connections.get(sender_sock, ("", 0))[0]
-
-        new_peer = (sender_ip, listen_port)
-        with self.node.peer_list_lock:
-            if new_peer not in self.node.bootstrap_peers:
-                self.node.bootstrap_peers.add(new_peer)
-                print(f"Discovered peer: {new_peer}")
-
-        return False  # Do NOT forward HELLO messages
-
-class MessageFramer:
-    """
-    Handles message framing with 4-byte big-endian length prefixes.
-    Stateless and thread-safe (all methods are static).
-    """
-    HEADER_FORMAT = ">I"  # 4-byte unsigned integer (big-endian)
-    HEADER_SIZE = struct.calcsize(HEADER_FORMAT)
-
-    @staticmethod
-    def frame_message(data: bytes) -> bytes:
-        """Add length prefix to raw bytes"""
-        return struct.pack(MessageFramer.HEADER_FORMAT, len(data)) + data
-
-    @staticmethod
-    def deframe_data(buffer: bytes) -> Tuple[Optional[bytes], bytes]:
-        """
-        Attempt to extract a complete message from buffer.
-        Returns (message, remaining_buffer)
-        """
-        if len(buffer) < MessageFramer.HEADER_SIZE:
-            return None, buffer
-
-        payload_len = struct.unpack(
-            MessageFramer.HEADER_FORMAT,
-            buffer[:MessageFramer.HEADER_SIZE]
-        )[0]
-
-        total_needed = MessageFramer.HEADER_SIZE + payload_len
-        if len(buffer) < total_needed:
-            return None, buffer
-
-        message = buffer[MessageFramer.HEADER_SIZE:total_needed]
-        remaining = buffer[total_needed:]
-        return message, remaining
-
-    @staticmethod
-    def recv_message(sock: socket.socket) -> Optional[bytes]:
-        """Receive complete framed message from socket"""
-        try:
-            header = MessageFramer._recv_exact(sock, MessageFramer.HEADER_SIZE)
-            if not header:
-                return None
-
-            payload_len = struct.unpack(MessageFramer.HEADER_FORMAT, header)[0]
-            payload = MessageFramer._recv_exact(sock, payload_len)
-            return payload if payload else None
-        except (ConnectionError, struct.error):
-            return None
-
-    @staticmethod
-    def _recv_exact(sock: socket.socket, n: int) -> Optional[bytes]:
-        """Internal: read exactly n bytes from socket"""
-        data = bytearray()
-        while len(data) < n:
-            chunk = sock.recv(n - len(data))
-            if not chunk:  # EOF
-                return None
-            data.extend(chunk)
-        return bytes(data)
 
 class PeerNode:
     def __init__(self, host: str, port: int, bootstrap_peers: list, node_id: str = None):
@@ -164,6 +39,8 @@ class PeerNode:
 
         self.router = MessageRouter(self)
         self.router.add_handler("HELLO", HelloHandler(self))
+        self.router.add_handler("REQUEST", RequestHandler(self))
+        self.router.add_handler("RESPONSE", ResponseHandler(self))
 
         # Start core threads
         threading.Thread(target=self._listen_for_peers, daemon=True).start()
@@ -292,6 +169,22 @@ class PeerNode:
 
         return count
 
+    def _send_direct_message(self, message: dict, sock: socket.socket):
+        """Send message to a specific peer"""
+        data = json.dumps(message).encode()
+        framed = MessageFramer.frame_message(data)
+        
+        with self.connection_lock:  # Ensure thread-safe socket access
+            try:
+                sock.sendall(framed)
+            except Exception as e:
+                print(f"[{self.node_id}] Send error: {e}")
+                # Determine connection type for cleanup
+                if sock in self.inbound_connections:
+                    self._unregister_peer(sock, 'incoming')
+                elif sock in self.outbound_connections:
+                    self._unregister_peer(sock, 'outgoing')
+
     # --- Connection Management Helpers ---
     def _register_peer(self, sock: socket.socket, address: Tuple[str, int], connection_type: str):
         with self.connection_lock:
@@ -352,6 +245,7 @@ class PeerNode:
 if __name__ == "__main__":
     node1 = PeerNode('localhost', 6000, [('127.0.0.1', 6001)], "NODE-A")
     node2 = PeerNode('localhost', 6001, [], "NODE-B")
+    node3 = PeerNode('localhost', 6002, [('127.0.0.1', 6000)], "NODE-B")
 
     time.sleep(2)
 
@@ -361,7 +255,8 @@ if __name__ == "__main__":
             print("\nCurrent Connection Stats:")
             print(f"Node1: {node1.get_connection_stats()}")
             print(f"Node2: {node2.get_connection_stats()}")
-            node1.send_message({"type": "ping"})
+            print(f"Node3: {node3.get_connection_stats()}")
+            node1.send_message({'type': 'REQUEST', 'content': 'Need data'})
     except KeyboardInterrupt:
         node1.shutdown()
         node2.shutdown()

@@ -1,5 +1,5 @@
 import socket
-from typing import List, Dict, Callable
+from typing import List, Dict, Callable, Tuple
 
 
 class MessageRouter:
@@ -11,14 +11,14 @@ class MessageRouter:
 
     def add_handler(self, message_type: str, handler: Callable):
         """Register handler for a specific message type"""
-        with self.node.message_dedup_lock:  # Reuse existing lock
+        with self.node.message_dedup_lock:
             self.handlers[message_type] = handler
 
     def add_middleware(self, middleware_func: Callable):
         """Add pre-processing step (e.g., validation, logging)"""
         self.middleware.append(middleware_func)
 
-    def route_message(self, message: dict, sender_sock: socket.socket):
+    def route_message(self, message: dict, sender_addr: Tuple[str, int]):
         """Process incoming message through pipeline"""
         try:
             # Deserialize and deduplicate
@@ -37,16 +37,16 @@ class MessageRouter:
 
             # Route to handler or forward
             handler = self.handlers.get(msg_type, self.default_handler)
-            should_forward = handler(message, sender_sock)
+            should_forward = handler(message, sender_addr)
             
             # Forward if handler allows
             if should_forward:
-                self._forward_message(message, sender_sock)
+                self._forward_message(message, sender_addr)
 
         except json.JSONDecodeError:
-            print(f"Malformed message: {raw_message[:100]}")
+            print(f"Malformed message: {message}")
 
-    def _forward_message(self, message: dict, exclude_sock: socket.socket) -> bool:
+    def _forward_message(self, message: dict, exclude_addr: Tuple[str, int]) -> bool:
         """Default handler: forward message to all peers except sender"""
-        self.node._broadcast_message(message, exclude_sock)
+        self.node._broadcast_message(message, exclude_addr)
         return False  # Prevent re-forwarding loops

@@ -6,12 +6,11 @@ import time
 import uuid
 
 from itertools import chain
-from typing import Tuple
+from typing import Tuple, Set, Dict
+
 from router import MessageRouter
 from protocols import MessageFramer
-from handlers import HelloHandler
-from handlers import RequestHandler
-from handlers import ResponseHandler
+from handlers import HelloHandler, RequestHandler, ResponseHandler
 
 
 class PeerNode:
@@ -24,9 +23,9 @@ class PeerNode:
         self.bootstrap_peers: Set[Tuple[str, int]] = set(bootstrap_peers)
         self.peer_list_lock = threading.Lock()
         
-        # Connection tracking
-        self.inbound_connections = {}
-        self.outbound_connections = {}
+        # Connection tracking: { (host, port): socket }
+        self.inbound_connections: Dict[Tuple[str, int], socket.socket] = {}
+        self.outbound_connections: Dict[Tuple[str, int], socket.socket] = {}
         self.connection_lock = threading.Lock()
         
         # System control
@@ -57,7 +56,8 @@ class PeerNode:
         self.running = False
 
         with self.connection_lock:
-            for sock in list(self.inbound_connections.keys()) + list(self.outbound_connections.keys()):
+            sockets_to_close = list(self.inbound_connections.values()) + list(self.outbound_connections.values())
+            for sock in sockets_to_close:
                 try:
                     sock.close()
                 except Exception:
@@ -105,8 +105,8 @@ class PeerNode:
     def _handle_peer_messages(self):
         while self.running:
             try:
-                raw_msg, sender_sock, _ = self.message_inbox.get(timeout=1)
-                self.router.route_message(raw_msg, sender_sock)
+                raw_msg, sender_addr = self.message_inbox.get(timeout=1)
+                self.router.route_message(raw_msg, sender_addr)
             except queue.Empty:
                 continue
 
@@ -142,7 +142,7 @@ class PeerNode:
         except Exception as e:
             print(f"[{self.node_id}] Connection to {host}:{port} failed: {e}")
 
-    def _broadcast_message(self, message: dict, exclude_sock: socket.socket = None) -> int:
+    def _broadcast_message(self, message: dict, exclude_addr: Tuple[str, int] = None) -> int:
         data = json.dumps(message).encode()
         full_message = MessageFramer.frame_message(data)
         count = 0
@@ -152,8 +152,8 @@ class PeerNode:
                                     self.outbound_connections.items())
 
             to_remove = []
-            for sock, addr in all_connections:
-                if sock == exclude_sock:
+            for addr, sock in all_connections:
+                if addr == exclude_addr:
                     continue
 
                 try:
@@ -161,53 +161,79 @@ class PeerNode:
                     count += 1
                 except Exception as e:
                     print(f"[{self.node_id}] Send error to {addr[0]}:{addr[1]}: {e}")
-                    conn_type = 'incoming' if sock in self.inbound_connections else 'outgoing'
-                    to_remove.append((sock, conn_type))
+                    conn_type = 'incoming' if addr in self.inbound_connections else 'outgoing'
+                    to_remove.append( (addr, conn_type) )
 
-            for sock, conn_type in to_remove:
-                self._unregister_peer(sock, conn_type)
+            for addr, conn_type in to_remove:
+                self._unregister_peer_by_addr(addr, conn_type)
 
         return count
 
-    def _send_direct_message(self, message: dict, sock: socket.socket):
-        """Send message to a specific peer"""
+    def _send_direct_message(self, message: dict, addr: Tuple[str, int]):
+        """Send message to a specific peer address"""
         data = json.dumps(message).encode()
         framed = MessageFramer.frame_message(data)
         
-        with self.connection_lock:  # Ensure thread-safe socket access
+        with self.connection_lock:
+            sock = None
+            if addr in self.inbound_connections:
+                sock = self.inbound_connections[addr]
+            elif addr in self.outbound_connections:
+                sock = self.outbound_connections[addr]
+            
+            if not sock:
+                print(f"[{self.node_id}] No connection to {addr[0]}:{addr[1]}")
+                return
+            
             try:
                 sock.sendall(framed)
             except Exception as e:
-                print(f"[{self.node_id}] Send error: {e}")
-                # Determine connection type for cleanup
-                if sock in self.inbound_connections:
-                    self._unregister_peer(sock, 'incoming')
-                elif sock in self.outbound_connections:
-                    self._unregister_peer(sock, 'outgoing')
+                print(f"[{self.node_id}] Send error to {addr[0]}:{addr[1]}: {e}")
+                if addr in self.inbound_connections:
+                    self._unregister_peer_by_addr(addr, 'incoming')
+                elif addr in self.outbound_connections:
+                    self._unregister_peer_by_addr(addr, 'outgoing')
 
     # --- Connection Management Helpers ---
     def _register_peer(self, sock: socket.socket, address: Tuple[str, int], connection_type: str):
         with self.connection_lock:
-            if connection_type == "incoming":
-                self.inbound_connections[sock] = address
-            else:
-                self.outbound_connections[sock] = address
+            connections = self.inbound_connections if connection_type == "incoming" else self.outbound_connections
+            if address in connections:
+                existing_sock = connections[address]
+                try:
+                    existing_sock.close()
+                except Exception:
+                    pass
+            connections[address] = sock
 
         threading.Thread(
             target=self._handle_connection,
             args=(sock, connection_type),
             daemon=True
         ).start()
-
         print(f"[{self.node_id}] New {connection_type} connection to {address[0]}:{address[1]}")
 
     def _unregister_peer(self, sock: socket.socket, connection_type: str):
         with self.connection_lock:
-            connections = (self.inbound_connections if connection_type == "incoming"
-                else self.outbound_connections)
+            connections = self.inbound_connections if connection_type == "incoming" else self.outbound_connections
+            addr_to_remove = None
+            for addr, s in connections.items():
+                if s is sock:
+                    addr_to_remove = addr
+                    break
+            if addr_to_remove is not None:
+                del connections[addr_to_remove]
+                print(f"[{self.node_id}] {connection_type.capitalize()} connection closed: {addr_to_remove[0]}:{addr_to_remove[1]}")
+                try:
+                    sock.close()
+                except Exception:
+                    pass
 
-            if sock in connections:
-                addr = connections.pop(sock)
+    def _unregister_peer_by_addr(self, addr: Tuple[str, int], connection_type: str):
+        with self.connection_lock:
+            connections = self.inbound_connections if connection_type == 'incoming' else self.outbound_connections
+            if addr in connections:
+                sock = connections.pop(addr)
                 print(f"[{self.node_id}] {connection_type.capitalize()} connection closed: {addr[0]}:{addr[1]}")
                 try:
                     sock.close()
@@ -218,14 +244,31 @@ class PeerNode:
         while self.running:
             try:
                 payload = MessageFramer.recv_message(sock)
-                if payload:
-                    message = json.loads(payload.decode())
-                self.message_inbox.put((message, sock, connection_type))
-
+                if not payload:
+                    break
+                message = json.loads(payload.decode())
+                
+                # Determine sender address
+                with self.connection_lock:
+                    sender_addr = None
+                    if connection_type == 'incoming':
+                        for addr, s in self.inbound_connections.items():
+                            if s is sock:
+                                sender_addr = addr
+                                break
+                    else:
+                        for addr, s in self.outbound_connections.items():
+                            if s is sock:
+                                sender_addr = addr
+                                break
+                
+                if sender_addr:
+                    self.message_inbox.put( (message, sender_addr) )
+                else:
+                    print(f"[{self.node_id}] Message from unregistered connection")
             except Exception as e:
                 print(f"[{self.node_id}] Receive error: {e}")
                 break
-
         self._unregister_peer(sock, connection_type)
 
     # --- Utility Functions ---
@@ -236,8 +279,8 @@ class PeerNode:
 
         with self.connection_lock:
             all_remotes = chain(
-                self.inbound_connections.values(),
-                self.outbound_connections.values()
+                self.inbound_connections.keys(),
+                self.outbound_connections.keys()
             )
             return not any(remote == (host, port) for remote in all_remotes)
 
@@ -245,7 +288,7 @@ class PeerNode:
 if __name__ == "__main__":
     node1 = PeerNode('localhost', 6000, [('127.0.0.1', 6001)], "NODE-A")
     node2 = PeerNode('localhost', 6001, [], "NODE-B")
-    node3 = PeerNode('localhost', 6002, [('127.0.0.1', 6000)], "NODE-B")
+    node3 = PeerNode('localhost', 6002, [('127.0.0.1', 6000)], "NODE-C")
 
     time.sleep(2)
 
@@ -260,4 +303,5 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         node1.shutdown()
         node2.shutdown()
+        node3.shutdown()
         print("Network shutdown complete")
